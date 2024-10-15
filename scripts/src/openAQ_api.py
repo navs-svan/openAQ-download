@@ -126,6 +126,40 @@ class openAQ:
 
         return self._send_request(endpoint, params=params)
 
+    def get_parameters(
+        self,
+        parameter_id: int = None,
+        order_by: str = None,
+        sort_order: str = "asc",
+        parameter_type: str = None,
+        coordinates: str = None,
+        radius: int = None,
+        bbox: str = None,
+        iso: str = None,
+        countries_id: List[int] = None,
+        limit: int = 100,
+        page: int = 1,
+    ):
+
+        endpoint = "/v3/parameters"
+        if parameter_id:
+            endpoint = endpoint + f"/{parameter_id}"
+        else:
+            params = {
+                "order_by": order_by,
+                "sort_order": sort_order,
+                "parameter_type": parameter_type,
+                "coordinates": coordinates,
+                "radius": radius,
+                "bbox": bbox,
+                "iso": iso,
+                "countries_id": countries_id,
+                "limit": limit,
+                "page": page,
+            }
+
+        return self._send_request(endpoint, params=params)
+
 
 if __name__ == "__main__":
 
