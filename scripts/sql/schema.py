@@ -12,7 +12,7 @@ class Countries(Base):
     __tablename__ = "countries"
 
     country_id = Column(INTEGER, primary_key=True)
-    country_name = Column(TEXT, unique=True)
+    country_name = Column(TEXT)
     first_date = Column(TIMESTAMP)
     last_date = Column(TIMESTAMP)
 
@@ -23,7 +23,7 @@ class Locations(Base):
     __tablename__ = "locations"
 
     location_id = Column(INTEGER, primary_key=True)
-    location_name = Column(TEXT, unique=True)
+    location_name = Column(TEXT)
     latitude = Column(NUMERIC)
     longitude = Column(NUMERIC)
     first_date = Column(TIMESTAMP)
