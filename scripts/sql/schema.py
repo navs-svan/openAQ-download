@@ -26,6 +26,8 @@ class Locations(Base):
     location_name = Column(TEXT, unique=True)
     latitude = Column(NUMERIC)
     longitude = Column(NUMERIC)
+    first_date = Column(TIMESTAMP)
+    last_date = Column(TIMESTAMP)
     country_id = Column(INTEGER, ForeignKey(Countries.country_id))
 
     country = relationship("Countries", back_populates="location", lazy="joined")
@@ -48,9 +50,6 @@ class Sensors(Base):
     __tablename__ = "sensors"
 
     sensor_id = Column(INTEGER, primary_key=True)
-    min_measure = Column(NUMERIC)
-    max_measure = Column(NUMERIC)
-    avg_measure = Column(NUMERIC)
     parameter_id = Column(INTEGER, ForeignKey(Parameters.parameter_id))
 
     parameter = relationship("Parameters", back_populates="sensor", lazy="joined")
