@@ -10,7 +10,7 @@ from dotenv import find_dotenv, load_dotenv
 
 from sqlalchemy import URL, create_engine, select
 from sqlalchemy.orm import sessionmaker
-from sql.schema import Base, Countries, Locations, Parameters, Sensors
+from sql.schema import Base, Locations, Measurements
 from sqlalchemy.dialects.postgresql import insert
 
 
@@ -76,11 +76,17 @@ if __name__ == "__main__":
         Locations.first_date,
         Locations.last_date,
         Locations.location_name,
-    ).limit(30)
+    ).limit(100)
+
+    subq = (
+        select(Measurements.location_id)
+        .where(Measurements.location_id == Locations.location_id)
+        .exists()
+    )
 
     # DOWNLOAD FROM AWS S3 BUCKET
     ROOT_PATH = Path(__file__).parent.parent.resolve()
-    results = session.execute(location_stmt)
+    results = session.execute(location_stmt.where(~subq))
     for chunk in results.chunks(10):
         print("DOWNLOADING FROM AWS S3 BUCKET")
         for row in chunk:
@@ -108,8 +114,7 @@ if __name__ == "__main__":
         frame = pd.concat(dfs, axis=0, ignore_index=True)
 
         # INSERT INTO POSTGRES
-        # print("INSERTING INTO POSTGRES")
-
+        print("INSERTING INTO POSTGRES")
         while True:
             try:
                 frame.to_sql(
@@ -122,6 +127,8 @@ if __name__ == "__main__":
                 break
             except sqlalchemy.exc.IntegrityError as e:
                 # LOG THIS ERROR
+                # INSTEAD OF DROPPING, MAYBE LOOK FOR SAME PARAMETER AND SENSOR
+                # THEN REPLACE IT
                 print(e.orig.diag.message_detail)
 
                 error_sensor_id = re.search(
