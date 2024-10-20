@@ -60,11 +60,11 @@ class Measurements(Base):
     __tablename__ = "measurements"
 
     location_id = Column(INTEGER, ForeignKey(Locations.location_id), primary_key=True)
-    sensor_id = Column(INTEGER, ForeignKey(Sensors.sensor_id), primary_key=True)
+    sensors_id = Column(INTEGER, ForeignKey(Sensors.sensor_id), primary_key=True)
     datetime = Column(TIMESTAMP, primary_key=True)
     value = Column(NUMERIC)
 
-    UniqueConstraint(location_id, sensor_id, datetime, name="measure_uix")
+    UniqueConstraint(location_id, sensors_id, datetime, name="measure_uix")
 
     def __init__(self, location, sensor, datetime, value):
         self.location = location
