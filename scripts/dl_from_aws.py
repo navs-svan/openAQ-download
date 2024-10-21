@@ -42,6 +42,7 @@ def dl_from_aws(loc_id, year, loc_name):
 def read_csv(csv_path: pathlib.WindowsPath):
     dfs = []
     data_folder = (csv_path).glob("**/*.gz")
+
     for file in data_folder:
         df = pd.read_csv(
             file,
@@ -53,10 +54,10 @@ def read_csv(csv_path: pathlib.WindowsPath):
     try:
         frame = pd.concat(dfs, axis=0, ignore_index=True)
         return frame
-    except ValueError:
+    except ValueError as err:
         # happens when there is no data for the location
         # but there is a recorded date in the api database
-        raise ValueError
+        raise ValueError(err)
 
 
 def postgres_ignore_duplicate(table, conn, keys, data_iter):
@@ -65,7 +66,9 @@ def postgres_ignore_duplicate(table, conn, keys, data_iter):
     conn.execute(insert_statement)
 
 
-def insert_postgres(frame: pd.DataFrame, engine: sqlalchemy.engine.base.Engine):
+def insert_postgres(
+    frame: pd.DataFrame, engine: sqlalchemy.engine.base.Engine, location_id: int
+):
     while True:
         try:
             frame_upload = frame.drop(columns=["parameter"])
@@ -77,22 +80,32 @@ def insert_postgres(frame: pd.DataFrame, engine: sqlalchemy.engine.base.Engine):
                 method=postgres_ignore_duplicate,
             )
             return
-        except sqlalchemy.exc.IntegrityError as e:
-            print(e.orig.diag.message_detail)
+        except sqlalchemy.exc.IntegrityError as err:
+            print(err.orig.diag.message_detail)
             print("Updating rows")
 
-            error_sensor_id = re.search(
-                pattern=r"=\((\d*)", string=e.orig.diag.message_detail
+            error_field = re.search(
+                pattern=r"\((.*)\)=", string=err.orig.diag.message_detail
             ).group(1)
 
-            condition = frame["sensors_id"] != int(error_sensor_id)
-            dropped = frame[~condition]
-            dropped["sensors_id"] = dropped.apply(
-                lambda row: convert_dict[row["parameter"]], axis=1
-            )
+            if error_field == "sensors_id":
+                error_sensor_id = re.search(
+                    pattern=r"=\((\d*)", string=err.orig.diag.message_detail
+                ).group(1)
 
-            retained = frame[condition]
-            frame = pd.concat([dropped, retained], axis=0, ignore_index=True)
+                condition = frame["sensors_id"] != int(error_sensor_id)
+                dropped = frame[~condition]
+                dropped["sensors_id"] = dropped.apply(
+                    lambda row: convert_dict[row["parameter"]], axis=1
+                )
+
+                retained = frame[condition]
+                frame = pd.concat([dropped, retained], axis=0, ignore_index=True)
+            elif error_field == "location_id":
+                # Weird, might be better to just raise an error and deal with the while
+                # loop outside of this function
+                frame["location_id"] = location_id
+
             continue
 
 
@@ -104,23 +117,24 @@ def main(row: sqlalchemy.engine.row.Row, engine: sqlalchemy.engine.base.Engine):
             dl_from_aws(row.location_id, year, loc_name_clean)
 
     # READ CSV FILES
-    csv_folder = ROOT_PATH / "data" / row.location_name
+    csv_folder = ROOT_PATH / "data" / loc_name_clean
 
     try:
         frame = read_csv(csv_folder)
         # INSERT INTO POSTGRES
-        insert_postgres(frame=frame, engine=engine)
+        print("inserting")
+        insert_postgres(frame=frame, engine=engine, location_id=row.location_id)
         print(
-            f"Inserted {frame.shape[0]} rows from Location: {row.location_name} ({row.location_id})"
+            f"Inserted {frame.shape[0]} rows from Location: {loc_name_clean} ({row.location_id})"
         )
     except ValueError as err:
-        print(err)
+        print(f"Error: {err} in Location: {loc_name_clean}")
 
     # DELETE LOCAL FILES DIRECTORY
     try:
         shutil.rmtree(ROOT_PATH / "data" / loc_name_clean)
-    except OSError as e:
-        print("Error: %s : %s" % (ROOT_PATH / "data" / loc_name_clean, e.strerror))
+    except OSError as err:
+        print("Error: %s : %s" % (ROOT_PATH / "data" / loc_name_clean, err.strerror))
 
 
 if __name__ == "__main__":
@@ -166,12 +180,16 @@ if __name__ == "__main__":
     convert_dict = {row.parameter_name: row.sensor_id for row in params_results}
 
     # RETRIEVE LOCATION IDs FROM DATABASE
-    location_stmt = select(
-        Locations.location_id,
-        Locations.first_date,
-        Locations.last_date,
-        Locations.location_name,
-    ).where(Locations.first_date != None)
+    location_stmt = (
+        select(
+            Locations.location_id,
+            Locations.first_date,
+            Locations.last_date,
+            Locations.location_name,
+        )
+        .where(Locations.first_date != None)
+        # .limit(1)
+    )
 
     subq = (
         select(Measurements.location_id)
