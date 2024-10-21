@@ -1,10 +1,13 @@
+import itertools
 import subprocess
 import os
 import shutil
 import re
 import sqlalchemy
+import pathlib
 import pandas as pd
 
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from dotenv import find_dotenv, load_dotenv
 
@@ -15,13 +18,13 @@ from sqlalchemy.dialects.postgresql import insert
 
 pd.options.mode.chained_assignment = None  # default='warn'
 
-def dl_from_aws(loc_id, year, loc_name, root_path):
-    # Create local data directory
-    loc_name_clean = re.sub('[\\/:*?"<>|]', "", loc_name).strip(" ")
-    data_path = root_path / "data" / loc_name_clean / str(year)
-    Path(data_path).mkdir(parents=True, exist_ok=True)
-    # Download files
 
+def dl_from_aws(loc_id, year, loc_name):
+    # Create local data directory
+    data_path = ROOT_PATH / "data" / loc_name / str(year)
+    Path(data_path).mkdir(parents=True, exist_ok=True)
+
+    # Download files
     push = subprocess.call(
         [
             "aws",
@@ -36,17 +39,92 @@ def dl_from_aws(loc_id, year, loc_name, root_path):
     )
 
 
+def read_csv(csv_path: pathlib.WindowsPath):
+    dfs = []
+    data_folder = (csv_path).glob("**/*.gz")
+    for file in data_folder:
+        df = pd.read_csv(
+            file,
+            usecols=["location_id", "sensors_id", "datetime", "value", "parameter"],
+            compression="gzip",
+        )
+        dfs.append(df)
+
+    try:
+        frame = pd.concat(dfs, axis=0, ignore_index=True)
+        return frame
+    except ValueError:
+        # happens when there is no data for the location
+        # but there is a recorded date in the api database
+        raise ValueError
+
+
 def postgres_ignore_duplicate(table, conn, keys, data_iter):
-
     data = [dict(zip(keys, row)) for row in data_iter]
+    insert_statement = insert(table.table).values(data).on_conflict_do_nothing()
+    conn.execute(insert_statement)
 
-    insert_statement = insert(table.table).values(data)
-    upsert_statement = insert_statement.on_conflict_do_nothing()
-    conn.execute(upsert_statement)
+
+def insert_postgres(frame: pd.DataFrame, engine: sqlalchemy.engine.base.Engine):
+    while True:
+        try:
+            frame_upload = frame.drop(columns=["parameter"])
+            frame_upload.to_sql(
+                name="measurements",
+                con=engine,
+                if_exists="append",
+                index=False,
+                method=postgres_ignore_duplicate,
+            )
+            return
+        except sqlalchemy.exc.IntegrityError as e:
+            print(e.orig.diag.message_detail)
+            print("Updating rows")
+
+            error_sensor_id = re.search(
+                pattern=r"=\((\d*)", string=e.orig.diag.message_detail
+            ).group(1)
+
+            condition = frame["sensors_id"] != int(error_sensor_id)
+            dropped = frame[~condition]
+            dropped["sensors_id"] = dropped.apply(
+                lambda row: convert_dict[row["parameter"]], axis=1
+            )
+
+            retained = frame[condition]
+            frame = pd.concat([dropped, retained], axis=0, ignore_index=True)
+            continue
+
+
+def main(row: sqlalchemy.engine.row.Row, engine: sqlalchemy.engine.base.Engine):
+    if row.first_date and row.last_date:
+        loc_name_clean = re.sub('[\\/:*?"<>|]', "", row.location_name).strip(" ")
+
+        for year in range(row.first_date.year, row.last_date.year + 1):
+            dl_from_aws(row.location_id, year, loc_name_clean)
+
+    # READ CSV FILES
+    csv_folder = ROOT_PATH / "data" / row.location_name
+
+    try:
+        frame = read_csv(csv_folder)
+        # INSERT INTO POSTGRES
+        insert_postgres(frame=frame, engine=engine)
+        print(
+            f"Inserted {frame.shape[0]} rows from Location: {row.location_name} ({row.location_id})"
+        )
+    except ValueError as err:
+        print(err)
+
+    # DELETE LOCAL FILES DIRECTORY
+    try:
+        shutil.rmtree(ROOT_PATH / "data" / loc_name_clean)
+    except OSError as e:
+        print("Error: %s : %s" % (ROOT_PATH / "data" / loc_name_clean, e.strerror))
 
 
 if __name__ == "__main__":
-    # ENVIRONMENT VARIABLES
+    # DEFINE VARIABLES
     env_file = find_dotenv(".env")
     load_dotenv(env_file)
 
@@ -56,7 +134,7 @@ if __name__ == "__main__":
     DBNAME = os.environ.get("DBNAME")
     DBPASS = os.environ.get("DBPASS")
 
-    CHUNKSIZE=1
+    ROOT_PATH = Path(__file__).parent.parent.resolve()
 
     # CREATE SESSION
     engine_url = URL.create(
@@ -71,8 +149,7 @@ if __name__ == "__main__":
     Session = sessionmaker(bind=engine)
     session = Session()
 
-    # RETRIEVE UNIQUE PARAMETERS WITH SENSORS
-    # TO CREATE convert_dict
+    # RETRIEVE UNIQUE PARAMETERS WITH SENSORS TO CREATE convert_dict
     unique_cte = (
         select(
             Sensors.sensor_id,
@@ -83,13 +160,12 @@ if __name__ == "__main__":
         .join_from(Sensors, Parameters)
         .cte()
     )
+
     convert_stmt = select(unique_cte).where(unique_cte.c.row == 1)
     params_results = session.execute(convert_stmt)
-    convert_dict = {row.parameter_name:row.sensor_id for row in params_results}
+    convert_dict = {row.parameter_name: row.sensor_id for row in params_results}
 
     # RETRIEVE LOCATION IDs FROM DATABASE
-    print(f"RETRIEVING LOCATION IDs")
-
     location_stmt = select(
         Locations.location_id,
         Locations.first_date,
@@ -103,82 +179,9 @@ if __name__ == "__main__":
         .exists()
     )
 
-    # DOWNLOAD FROM AWS S3 BUCKET
-    ROOT_PATH = Path(__file__).parent.parent.resolve()
-    results = session.execute(location_stmt.where(~subq))  #CHANGE LATER
-    for chunk in results.chunks(CHUNKSIZE):
-        print("DOWNLOADING FROM AWS S3 BUCKET")
-        for row in chunk:
-            if row[1] and row[2]:
-                print(row[3])
-                for year in range(row[1].year, row[2].year + 1):
-                    print(year)
-                    dl_from_aws(row[0], year, row[3], ROOT_PATH)
+    results = session.execute(location_stmt.where(~subq))
 
-        # READ CSV FILES
-        print("READING CSV FILES")
-
-        usecols = ["location_id", "sensors_id", "datetime", "value", "parameter"]
-        params = {
-            "compression": "gzip",
-            "usecols": usecols,
-        }
-
-        dfs = []
-        data_folder = (ROOT_PATH / "data").glob("**/*.gz")
-        for file in data_folder:
-            df = pd.read_csv(file, **params)
-            dfs.append(df)
-
-        try: 
-            frame = pd.concat(dfs, axis=0, ignore_index=True)
-        except ValueError as err:
-            # happens when there is no data for the location
-            # but there is a recorded date in the api database
-            print(err)
-            continue
-
-
-        # INSERT INTO POSTGRES
-        print("INSERTING INTO POSTGRES")
-        while True:
-            try:
-                print(frame.shape)
-
-                frame_upload = frame.drop(columns=["parameter"])
-                frame_upload.to_sql(
-                    name="measurements",
-                    con=engine,
-                    if_exists="append",
-                    index=False,
-                    method=postgres_ignore_duplicate,
-                )
-                break
-            except sqlalchemy.exc.IntegrityError as e:
-                # LOG THIS ERROR
-                # INSTEAD OF DROPPING, MAYBE LOOK FOR SAME PARAMETER AND SENSOR
-                # THEN REPLACE IT
-                print(e.orig.diag.message_detail)
-
-                error_sensor_id = re.search(
-                    pattern=r"=\((\d*)", string=e.orig.diag.message_detail
-                ).group(1)
-                
-                condition = frame["sensors_id"] != int(error_sensor_id)
-
-                print("UPDATING PROBLEMATIC ROWS")
-
-                dropped = frame[~condition]
-                dropped["sensors_id"] = dropped.apply(lambda row: convert_dict[row["parameter"]], axis=1)
-                retained = frame[condition]
-
-                frame = pd.concat([dropped, retained], axis=0, ignore_index=True)
-                print(frame.shape)
-                continue
-
-        # DELETE LOCAL FILES DIRECTORY
-        print("DELETING LOCAL DATA DIRECTORY")
-        try:
-            shutil.rmtree(ROOT_PATH / "data")
-        except OSError as e:
-            print("Error: %s : %s" % (ROOT_PATH / "data", e.strerror))
+    # MAIN FUNCTION
+    iter_engine = itertools.repeat(engine)
+    with ThreadPoolExecutor() as executor:
+        future = executor.map(main, results, iter_engine)
