@@ -8,11 +8,12 @@ import pandas as pd
 from pathlib import Path
 from dotenv import find_dotenv, load_dotenv
 
-from sqlalchemy import URL, create_engine, select
+from sqlalchemy import URL, create_engine, select, func
 from sqlalchemy.orm import sessionmaker
-from sql.schema import Base, Locations, Measurements
+from sql.schema import Base, Locations, Measurements, Sensors, Parameters
 from sqlalchemy.dialects.postgresql import insert
 
+pd.options.mode.chained_assignment = None  # default='warn'
 
 def dl_from_aws(loc_id, year, loc_name, root_path):
     # Create local data directory
@@ -55,6 +56,8 @@ if __name__ == "__main__":
     DBNAME = os.environ.get("DBNAME")
     DBPASS = os.environ.get("DBPASS")
 
+    CHUNKSIZE=1
+
     # CREATE SESSION
     engine_url = URL.create(
         drivername="postgresql+psycopg2",
@@ -68,6 +71,22 @@ if __name__ == "__main__":
     Session = sessionmaker(bind=engine)
     session = Session()
 
+    # RETRIEVE UNIQUE PARAMETERS WITH SENSORS
+    # TO CREATE convert_dict
+    unique_cte = (
+        select(
+            Sensors.sensor_id,
+            Parameters.parameter_id,
+            Parameters.parameter_name,
+            func.row_number().over(partition_by=Parameters.parameter_id).label("row"),
+        )
+        .join_from(Sensors, Parameters)
+        .cte()
+    )
+    convert_stmt = select(unique_cte).where(unique_cte.c.row == 1)
+    params_results = session.execute(convert_stmt)
+    convert_dict = {row.parameter_name:row.sensor_id for row in params_results}
+
     # RETRIEVE LOCATION IDs FROM DATABASE
     print(f"RETRIEVING LOCATION IDs")
 
@@ -76,7 +95,7 @@ if __name__ == "__main__":
         Locations.first_date,
         Locations.last_date,
         Locations.location_name,
-    ).limit(100)
+    ).where(Locations.first_date != None)
 
     subq = (
         select(Measurements.location_id)
@@ -86,8 +105,8 @@ if __name__ == "__main__":
 
     # DOWNLOAD FROM AWS S3 BUCKET
     ROOT_PATH = Path(__file__).parent.parent.resolve()
-    results = session.execute(location_stmt.where(~subq))
-    for chunk in results.chunks(10):
+    results = session.execute(location_stmt.where(~subq))  #CHANGE LATER
+    for chunk in results.chunks(CHUNKSIZE):
         print("DOWNLOADING FROM AWS S3 BUCKET")
         for row in chunk:
             if row[1] and row[2]:
@@ -99,7 +118,7 @@ if __name__ == "__main__":
         # READ CSV FILES
         print("READING CSV FILES")
 
-        usecols = ["location_id", "sensors_id", "datetime", "value"]
+        usecols = ["location_id", "sensors_id", "datetime", "value", "parameter"]
         params = {
             "compression": "gzip",
             "usecols": usecols,
@@ -111,13 +130,23 @@ if __name__ == "__main__":
             df = pd.read_csv(file, **params)
             dfs.append(df)
 
-        frame = pd.concat(dfs, axis=0, ignore_index=True)
+        try: 
+            frame = pd.concat(dfs, axis=0, ignore_index=True)
+        except ValueError as err:
+            # happens when there is no data for the location
+            # but there is a recorded date in the api database
+            print(err)
+            continue
+
 
         # INSERT INTO POSTGRES
         print("INSERTING INTO POSTGRES")
         while True:
             try:
-                frame.to_sql(
+                print(frame.shape)
+
+                frame_upload = frame.drop(columns=["parameter"])
+                frame_upload.to_sql(
                     name="measurements",
                     con=engine,
                     if_exists="append",
@@ -134,13 +163,17 @@ if __name__ == "__main__":
                 error_sensor_id = re.search(
                     pattern=r"=\((\d*)", string=e.orig.diag.message_detail
                 ).group(1)
-                location = frame[frame["sensors_id"] == int(error_sensor_id)].iat[0, 0]
-                year = frame[frame["sensors_id"] == int(error_sensor_id)].iat[0, 2]
+                
+                condition = frame["sensors_id"] != int(error_sensor_id)
 
-                print(location, year)
+                print("UPDATING PROBLEMATIC ROWS")
 
-                print("DROPPING ROWS")
-                frame = frame[frame["sensors_id"] != int(error_sensor_id)]
+                dropped = frame[~condition]
+                dropped["sensors_id"] = dropped.apply(lambda row: convert_dict[row["parameter"]], axis=1)
+                retained = frame[condition]
+
+                frame = pd.concat([dropped, retained], axis=0, ignore_index=True)
+                print(frame.shape)
                 continue
 
         # DELETE LOCAL FILES DIRECTORY
