@@ -2,7 +2,7 @@ import requests
 from var import OPENAQ_API_KEY
 import json
 import sys
-
+import time
 from typing import List
 
 # get countries id
@@ -21,32 +21,39 @@ class openAQ:
 
     def _send_request(self, endpoint, **params):
         endpoint = "https://api.openaq.org" + endpoint
-        r = requests.get(endpoint, **params, headers=self._auth_header())
+        retries = 10
+        for _ in range(retries):
+            r = requests.get(endpoint, **params, headers=self._auth_header())
+            if r.status_code == 200:
+                # print(r.headers["x-ratelimit-used"])
+                return r.json()
 
-        if r.status_code == 200:
-            # print(r.headers["x-ratelimit-used"])
-            return r.json()
+            elif r.status_code == 429:
+                # limit rate exceeded
+                ...
+            elif r.status_code == 422:
+                # prints out only one error can be improved
+                resp = r.json()
 
-        elif r.status_code == 429:
-            # limit rate exceeded
-            ...
-        elif r.status_code == 422:
-            # prints out only one error can be improved
-            resp = r.json()
+                if isinstance(resp, str):
+                    # eval might be dangerous but we're dealing with an API response
+                    # so we can expect what the input will be
+                    error = eval(resp)[0]
+                elif isinstance(resp, dict):
+                    error = resp["detail"][0]
 
-            if isinstance(resp, str):
-                # eval might be dangerous but we're dealing with an API response
-                # so we can expect what the input will be
-                error = eval(resp)[0]
-            elif isinstance(resp, dict):
-                error = resp["detail"][0]
+                msg = (
+                    f"Error type: {error['type']}\nLocation: {error['loc']}\n",
+                    f"Message: {error['msg']}\nInput: {error['input']}",
+                )
+                print("".join(msg))
+                sys.exit(1)
+            elif r.status_code <= 500:
+                print("Internal Server Error\nRetrying")
+                time.sleep(5)
 
-            msg = (
-                f"Error type: {error['type']}\nLocation: {error['loc']}\n",
-                f"Message: {error['msg']}\nInput: {error['input']}",
-            )
-            print("".join(msg))
-            sys.exit(1)
+        print("Max retries exceeded")
+        sys.exit(1)
 
     def get_measurements(self): ...
 
