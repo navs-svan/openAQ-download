@@ -1,0 +1,5 @@
+.venv/
+dashboard/
+imgs/
+README.md
+.gitignore
